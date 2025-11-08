@@ -1,5 +1,8 @@
 fastapi
 uvicorn[standard]
+python-dotenv
+python-multipart
+deta
 langchain
 langchain-core
 langchain-community
@@ -7,6 +10,3 @@ langchain-google-genai
 langchain-text-splitters
 pypdf
 faiss-cpu
-python-dotenv
-python-multipart
-
