@@ -12,7 +12,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
 # ----------------------------
@@ -44,7 +44,7 @@ app.add_middleware(
 # ----------------------------
 # These are loaded once when the API starts
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+embedding_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
 # This will hold our vector store in memory
 # Note: This is simple. For a real app, you'd save this to disk/DB
@@ -197,4 +197,5 @@ async def ask_question(request: QuestionRequest):
 
 # This allows you to run the API locally with "python main.py"
 if __name__ == "__main__":
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
