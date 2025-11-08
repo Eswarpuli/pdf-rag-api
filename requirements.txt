@@ -9,4 +9,5 @@ langchain-text-splitters
 pypdf
 faiss-cpu
 python-dotenv
+sentence-transformers
 python-multipart
