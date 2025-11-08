@@ -4,10 +4,9 @@ langchain
 langchain-core
 langchain-community
 langchain-google-genai
-langchain-huggingface
 langchain-text-splitters
 pypdf
 faiss-cpu
 python-dotenv
-sentence-transformers
 python-multipart
+
