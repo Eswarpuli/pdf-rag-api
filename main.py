@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 import tempfile
 from fastapi import FastAPI, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel # This import is important
 import uvicorn
 from typing import List, Any
 
@@ -46,23 +46,70 @@ embedding_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 global_vector_store: FAISS = None 
 
 # --- NEW: Define the path on Render's persistent disk ---
-# This matches the "/var/data" Mount Path you set in Render
 FAISS_INDEX_PATH = "/var/data/my_faiss_index"
 
 # ----------------------------
 # Helper Functions (Your code, unchanged)
 # ----------------------------
 def get_top_docs_from_retriever(retriever, query, k=3):
-    # ... (same as your current code)
-    pass
+    """
+    Try several common method names to get relevant docs. Return list of doc objects.
+    """
+    for method in ("get_relevant_documents", "get_relevant_documents_by_text", "get_documents", "retrieve", "get_relevant_items"):
+        fn = getattr(retriever, method, None)
+        if callable(fn):
+            try:
+                docs = fn(query)
+                return docs
+            except TypeError:
+                try:
+                    docs = fn(query, k)
+                    return docs
+                except Exception:
+                    continue
+            except Exception:
+                continue
+    try:
+        docs = retriever.get_relevant_documents(query)
+        return docs
+    except Exception:
+        return []
 
 def build_context_prompt(docs, user_question, max_chars=2500):
-    # ... (same as your current code)
-    pass
+    chunks = []
+    total = 0
+    for d in docs:
+        text = getattr(d, "page_content", None) or getattr(d, "content", None) or str(d)
+        if not text:
+            continue
+        if total + len(text) > max_chars:
+            remaining = max_chars - total
+            if remaining > 50:
+                chunks.append(text[:remaining])
+                total += remaining
+            break
+        chunks.append(text)
+        total += len(text)
+    context = "\n\n---\n\n".join(chunks) if chunks else ""
+    system = (
+        "You are an assistant that answers user questions based only on the provided context. "
+        "If the answer is not in the context, say you don't know."
+    )
+    prompt = f"{system}\n\nCONTEXT:\n{context}\n\nQUESTION:\n{user_question}\n\nAnswer concisely."
+    return prompt
 
 # ----------------------------
-# API Endpoints (MODIFIED FOR DISK)
+# API Endpoints
 # ----------------------------
+
+# --- Health Check Endpoint ---
+@app.get("/health")
+async def health_check():
+    """
+    A simple endpoint to check if the server is awake and active.
+    """
+    print("Health check successful.")
+    return {"status": "active"}
 
 @app.post("/upload-pdf/")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -99,14 +146,17 @@ async def upload_pdf(file: UploadFile = File(...)):
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+
+#  Define the QuestionRequest class ---
+class QuestionRequest(BaseModel):
+    query: str
+
 @app.post("/ask-question/")
 async def ask_question(request: QuestionRequest):
     global global_vector_store, llm, embedding_model # Need all three
     user_input = request.query
     bot_reply = ""
 
-    # --- NEW: LOAD-FROM-DISK LOGIC ---
-    # If server slept, global_vector_store is None. Try to load from disk.
     if global_vector_store is None:
         if os.path.exists(FAISS_INDEX_PATH):
             print("Server woke up. Loading index from disk...")
@@ -114,7 +164,6 @@ async def ask_question(request: QuestionRequest):
                 global_vector_store = FAISS.load_local(
                     FAISS_INDEX_PATH, 
                     embedding_model,
-                    # This is required for FAISS.load_local
                     allow_dangerous_deserialization=True 
                 )
                 print("Index loaded successfully from disk.")
@@ -122,15 +171,12 @@ async def ask_question(request: QuestionRequest):
                 print(f"Error loading index from disk: {e}")
         else:
             print("No index found on disk. Ready for general chat.")
-    # --- END OF NEW LOGIC ---
 
     try:
         # Check if PDF is loaded (either from upload or disk)
         if global_vector_store is not None:
             print("Querying with RAG...")
             retriever = global_vector_store.as_retriever(search_kwargs={"k": 3})
-            # ... [rest of your RAG logic from main.py] ...
-            # (just copy/paste it here)
             docs = get_top_docs_from_retriever(retriever, user_input, k=3)
             prompt = build_context_prompt(docs, user_input, max_chars=2500)
             
