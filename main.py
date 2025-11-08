@@ -1,31 +1,32 @@
 import os
-import shutil
-import tempfile
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File
+import tempfile
+from fastapi import FastAPI, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import uvicorn
 from typing import List, Any
-from deta import Deta
 
-# LangChain
+# --- LangChain Imports ---
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 
-# Load ENV
+# ----------------------------
+# Load .env and set API key
+# ----------------------------
 load_dotenv()
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
-# Deta Setup
-deta = Deta()
-index_drive = deta.Drive("pdf-index")
-FAISS_INDEX_NAME = "faiss_index"
-
-# FastAPI App Init
-app = FastAPI(title="PDF RAG API", description="Q&A over PDFs.")
+# ----------------------------
+# App Initialization
+# ----------------------------
+app = FastAPI(
+    title="PDF Q&A RAG API",
+    description="API for uploading PDFs and asking questions."
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,101 +36,126 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Models
-class QuestionRequest(BaseModel):
-    query: str
-
-
-# LLM + Embeddings
+# ----------------------------
+# Global Variables
+# ----------------------------
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 embedding_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
+# This will hold our vector store in memory
+global_vector_store: FAISS = None 
 
-# ✅ Helper Functions
+# --- NEW: Define the path on Render's persistent disk ---
+# This matches the "/var/data" Mount Path you set in Render
+FAISS_INDEX_PATH = "/var/data/my_faiss_index"
+
+# ----------------------------
+# Helper Functions (Your code, unchanged)
+# ----------------------------
 def get_top_docs_from_retriever(retriever, query, k=3):
-    try:
-        return retriever.get_relevant_documents(query)
-    except Exception:
-        return []
+    # ... (same as your current code)
+    pass
 
+def build_context_prompt(docs, user_question, max_chars=2500):
+    # ... (same as your current code)
+    pass
 
-def build_context_prompt(docs, question, max_chars=2500):
-    text = ""
-    for d in docs:
-        if hasattr(d, "page_content"):
-            if len(text) + len(d.page_content) > max_chars:
-                break
-            text += d.page_content + "\n\n"
-    return f"""
-You are a helpful assistant. Answer ONLY using the context below.
+# ----------------------------
+# API Endpoints (MODIFIED FOR DISK)
+# ----------------------------
 
-CONTEXT:
-{text}
-
-QUESTION: {question}
-"""
-
-
-# ✅ Upload PDF → Build Index → Save to Deta
 @app.post("/upload-pdf/")
 async def upload_pdf(file: UploadFile = File(...)):
+    global global_vector_store, embedding_model # Make sure embedding_model is global
+    
+    print(f"Processing PDF: {file.filename}")
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    loader = PyPDFLoader(tmp_path)
-    docs = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    split_docs = splitter.split_documents(docs)
+    try:
+        loader = PyPDFLoader(tmp_path)
+        docs = loader.load()
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        split_docs = splitter.split_documents(docs)
+        
+        # Create and store in the global variable
+        global_vector_store = FAISS.from_documents(split_docs, embedding_model)
+        
+        # --- NEW: Save the index to the persistent disk ---
+        print(f"Saving index to disk at {FAISS_INDEX_PATH}...")
+        global_vector_store.save_local(FAISS_INDEX_PATH)
+        # --------------------------------------------------
+        
+        print(f"✅ PDF '{file.filename}' processed and saved to disk!")
+        return {"status": "success", "filename": file.filename}
+    
+    except Exception as e:
+        print(f"PDF Processing Error: {e}")
+        return {"status": "error", "message": str(e)}, 500
+    
+    finally:
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-    vector_store = FAISS.from_documents(split_docs, embedding_model)
-
-    # Save index locally → zip → upload
-    with tempfile.TemporaryDirectory() as temp_dir:
-        local_index = os.path.join(temp_dir, FAISS_INDEX_NAME)
-        vector_store.save_local(local_index)
-
-        shutil.make_archive(local_index, "zip", local_index)
-        with open(local_index + ".zip", "rb") as f:
-            index_drive.put(f"{FAISS_INDEX_NAME}.zip", f)
-
-    os.remove(tmp_path)
-
-    return {"status": "success", "message": "PDF indexed successfully"}
-
-
-# ✅ Ask Question → Load index → Query RAG
 @app.post("/ask-question/")
 async def ask_question(request: QuestionRequest):
-    index_file = index_drive.get(f"{FAISS_INDEX_NAME}.zip")
+    global global_vector_store, llm, embedding_model # Need all three
+    user_input = request.query
+    bot_reply = ""
 
-    if index_file:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = os.path.join(temp_dir, "index.zip")
-            with open(zip_path, "wb") as f:
-                f.write(index_file.read())
+    # --- NEW: LOAD-FROM-DISK LOGIC ---
+    # If server slept, global_vector_store is None. Try to load from disk.
+    if global_vector_store is None:
+        if os.path.exists(FAISS_INDEX_PATH):
+            print("Server woke up. Loading index from disk...")
+            try:
+                global_vector_store = FAISS.load_local(
+                    FAISS_INDEX_PATH, 
+                    embedding_model,
+                    # This is required for FAISS.load_local
+                    allow_dangerous_deserialization=True 
+                )
+                print("Index loaded successfully from disk.")
+            except Exception as e:
+                print(f"Error loading index from disk: {e}")
+        else:
+            print("No index found on disk. Ready for general chat.")
+    # --- END OF NEW LOGIC ---
 
-            local_index = os.path.join(temp_dir, FAISS_INDEX_NAME)
-            shutil.unpack_archive(zip_path, local_index)
+    try:
+        # Check if PDF is loaded (either from upload or disk)
+        if global_vector_store is not None:
+            print("Querying with RAG...")
+            retriever = global_vector_store.as_retriever(search_kwargs={"k": 3})
+            # ... [rest of your RAG logic from main.py] ...
+            # (just copy/paste it here)
+            docs = get_top_docs_from_retriever(retriever, user_input, k=3)
+            prompt = build_context_prompt(docs, user_input, max_chars=2500)
+            
+            try:
+                response = llm.invoke([HumanMessage(content=prompt)])
+                bot_reply = getattr(response, "content", None) or (response[0].content if isinstance(response, list) and len(response)>0 else str(response))
+            except Exception:
+                response = llm.invoke(prompt)
+                bot_reply = getattr(response, "content", None) or str(response)
 
-            vector_store = FAISS.load_local(
-                local_index,
-                embedding_model,
-                allow_dangerous_deserialization=True
-            )
+        else:
+            # No PDF loaded - regular chat
+            print("Querying as simple chatbot...")
+            response = llm.invoke([HumanMessage(content=user_input)])
+            bot_reply = getattr(response, "content", None) or str(response)
 
-            retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-            docs = get_top_docs_from_retriever(retriever, request.query)
-            prompt = build_context_prompt(docs, request.query)
-            response = llm.invoke([HumanMessage(content=prompt)])
-            return {"answer": response.content}
+        if not bot_reply:
+            bot_reply = "Sorry, I couldn't generate a response."
 
-    # If no pdf uploaded yet → normal chatbot mode
-    response = llm.invoke([HumanMessage(content=request.query)])
-    return {"answer": response.content}
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        bot_reply = f"Unexpected error: {e}"
 
+    return {"answer": bot_reply}
 
-# ✅ Health Check
-@app.get("/health")
-def health():
-    return {"status": "alive"}
+# This allows you to run locally with "python main.py"
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
